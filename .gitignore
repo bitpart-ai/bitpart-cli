@@ -1,0 +1,37 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment files (may contain secrets)
+.env
+.env.local
+
+# Editors / IDEs
+.idea/
+.vscode/
+.zed/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated audio output
+*.mp3
+*.wav
+
+# Coverage / logs
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.log
