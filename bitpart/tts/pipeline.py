@@ -660,12 +660,12 @@ def _print_drift_warning(
         warn(f"  ... and {len(drift_files) - max_show} more")
     print()
     _hash_banner("Drift Detected")
-    print("To regenerate these files, re-run with --regenerate-drift:")
+    warn("To regenerate these audio files, re-run with --regenerate-drift:")
     cmd = _regenerate_drift_command(cfg)
     if cmd is not None:
-        print('""" Run Command:')
-        print(f"{cmd}")
-        print('"""')
+        warn('""" Run Command:')
+        warn(f"{cmd}")
+        warn('"""')
 
 
 def _print_provider_mismatch_warning(
