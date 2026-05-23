@@ -25,6 +25,8 @@ from pathlib import Path
 
 from bitpart.tts.config import PROVIDER_DRIFT_KEYS
 
+_UNSET_META = object()
+
 
 def _provider_cfg_for_metadata(cfg: dict) -> dict:
     """Copy provider config keeping only JSON-friendly values."""
@@ -163,6 +165,8 @@ def check_metadata_drift(
     current_provider: str = "",
     character_name: str = "",
     row_idx: int | None = None,
+    *,
+    embedded_meta: dict | None | object = _UNSET_META,
 ) -> list[str]:
     """Compare the embedded metadata against current CSV / JSON expectations.
 
@@ -176,7 +180,10 @@ def check_metadata_drift(
     This keeps legacy files quiet when you add a new optional key to
     ``character_voices.json`` later.
     """
-    meta = read_tts_metadata(path)
+    if embedded_meta is _UNSET_META:
+        meta = read_tts_metadata(path)
+    else:
+        meta = embedded_meta
     if meta is None:
         return []
     # 8 spaces aligns continuation lines under the bullet in the summary report.
