@@ -114,7 +114,7 @@ def test_drift_returns_empty_when_everything_matches(tmp_path):
     _embed(p)
     assert check_metadata_drift(
         str(p), expected_utterance_text="Hello", expected_config={"voice_id": "v1"},
-        current_provider="elevenlabs", character_name="Townsperson",
+        current_provider="elevenlabs",
     ) == []
 
 
@@ -133,12 +133,10 @@ def test_drift_detects_voice_id_change(tmp_path):
     _embed(p, voice_id="v1")
     issues = check_metadata_drift(
         str(p), expected_utterance_text="Hello", expected_config={"voice_id": "v2"},
-        current_provider="elevenlabs", character_name="Townsperson",
+        current_provider="elevenlabs",
     )
     assert len(issues) == 1
-    assert "voice_id drift" in issues[0]
-    assert "v1" in issues[0] and "v2" in issues[0]
-    assert "key=Townsperson" in issues[0]
+    assert issues[0] == "voice_id: audio file has 'v1', character_voices.json has 'v2'"
 
 
 def test_drift_detects_utterance_text_change(tmp_path):
@@ -147,10 +145,12 @@ def test_drift_detects_utterance_text_change(tmp_path):
     _embed(p, text="Hello")
     issues = check_metadata_drift(
         str(p), expected_utterance_text="Goodbye", expected_config={"voice_id": "v1"},
-        current_provider="elevenlabs", character_name="Townsperson",
+        current_provider="elevenlabs",
     )
     assert len(issues) == 1
-    assert "utterance_text drift" in issues[0]
+    assert "utterance_text:" in issues[0]
+    assert "audio file has 'Hello'" in issues[0]
+    assert "CSV has 'Goodbye'" in issues[0]
 
 
 def test_drift_detects_both_when_both_changed(tmp_path):
@@ -172,7 +172,7 @@ def test_drift_voice_id_message_includes_provider_when_same(tmp_path):
         str(p), expected_utterance_text="Hello", expected_config={"voice_id": "v2"},
         current_provider="elevenlabs",
     )
-    assert "provider=elevenlabs" in issues[0]
+    assert issues[0] == "voice_id: audio file has 'v1', character_voices.json has 'v2'"
 
 
 def test_drift_voice_id_message_distinguishes_providers_when_different(tmp_path):
@@ -184,8 +184,8 @@ def test_drift_voice_id_message_distinguishes_providers_when_different(tmp_path)
         current_provider="inworld",
     )
     msg = issues[0]
-    assert "provider(previous)=elevenlabs" in msg
-    assert "provider(current)=inworld" in msg
+    assert "provider elevenlabs" in msg
+    assert "provider inworld" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +202,10 @@ def test_drift_detects_elevenlabs_stability_change(tmp_path):
     issues = check_metadata_drift(
         str(p), expected_utterance_text="Hi",
         expected_config={"voice_id": "v1", "stability": 0.4},
-        current_provider="elevenlabs", character_name="Townsperson",
+        current_provider="elevenlabs",
     )
     assert len(issues) == 1
-    assert "stability drift" in issues[0]
-    assert "0.6" in issues[0] and "0.4" in issues[0]
-    assert "key=Townsperson" in issues[0]
-    assert "provider=elevenlabs" in issues[0]
+    assert issues[0] == "stability: audio file has 0.6, character_voices.json has 0.4"
 
 
 def test_drift_detects_elevenlabs_model_id_change(tmp_path):
@@ -224,7 +221,9 @@ def test_drift_detects_elevenlabs_model_id_change(tmp_path):
         current_provider="elevenlabs",
     )
     assert len(issues) == 1
-    assert "model_id drift" in issues[0]
+    assert "model_id:" in issues[0]
+    assert "eleven_multilingual_v2" in issues[0]
+    assert "eleven_turbo_v2_5" in issues[0]
 
 
 def test_drift_detects_inworld_temperature_change(tmp_path):
@@ -240,8 +239,7 @@ def test_drift_detects_inworld_temperature_change(tmp_path):
         current_provider="inworld",
     )
     assert len(issues) == 1
-    assert "temperature drift" in issues[0]
-    assert "1.0" in issues[0] and "1.4" in issues[0]
+    assert issues[0] == "temperature: audio file has 1.0, character_voices.json has 1.4"
 
 
 def test_drift_intersection_skips_key_missing_from_embedded(tmp_path):
@@ -293,40 +291,9 @@ def test_drift_detects_multiple_keys_at_once(tmp_path):
     # voice_id changed, stability changed, utterance_text changed; similarity_boost matches
     assert len(issues) == 3
     joined = "\n".join(issues)
-    assert "voice_id drift" in joined
-    assert "stability drift" in joined
-    assert "utterance_text drift" in joined
-
-
-def test_drift_messages_include_row_idx_when_provided(tmp_path):
-    """row_idx is surfaced in every drift message so users can find the CSV row fast."""
-    p = tmp_path / "a.mp3"
-    write_silence_mp3(p)
-    embed_mp3_metadata(
-        str(p), utterance_text="Hi", provider="elevenlabs",
-        provider_cfg={"voice_id": "v1", "stability": 0.6},
-    )
-    issues = check_metadata_drift(
-        str(p), expected_utterance_text="Bye",
-        expected_config={"voice_id": "v2", "stability": 0.4},
-        current_provider="elevenlabs", character_name="Townsperson6", row_idx=4,
-    )
-    assert len(issues) == 3
-    for msg in issues:
-        assert "csv_row=4" in msg
-        assert "key=Townsperson6" in msg
-
-
-def test_drift_messages_omit_row_when_row_idx_not_provided(tmp_path):
-    """No row_idx -> no csv_row=... fragment (back-compat for existing callers)."""
-    p = tmp_path / "a.mp3"
-    write_silence_mp3(p)
-    _embed(p, voice_id="v1")
-    issues = check_metadata_drift(
-        str(p), expected_utterance_text="Hi", expected_config={"voice_id": "v2"},
-        current_provider="elevenlabs", character_name="Townsperson",
-    )
-    assert "csv_row=" not in issues[0]
+    assert "voice_id:" in joined
+    assert "stability:" in joined
+    assert "utterance_text:" in joined
 
 
 # ---------------------------------------------------------------------------

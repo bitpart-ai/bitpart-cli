@@ -5,7 +5,6 @@ focused on orchestration and never has to touch raw file paths or column
 validation directly.
 """
 from pathlib import Path
-
 import pandas as pd
 
 
@@ -17,6 +16,13 @@ def get_audio_filename(character_id: str, utterance_id: str) -> str:
 def get_full_audio_path(filename: str, output_dir: str) -> str:
     """Return the absolute path for an audio file inside ``output_dir``."""
     return str(Path(output_dir) / filename)
+
+
+def csv_row_num(pandas_idx: int) -> int:
+    """Spreadsheet line number for log messages (not the Coppola ``index`` column).
+    Row 1 is the header; the first data row is row 2. Matches Excel/Sheets.
+    """
+    return pandas_idx + 2
 
 
 def ensure_output_dir(output_dir: str) -> None:
