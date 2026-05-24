@@ -46,8 +46,13 @@ def load_character_voices(path: str | Path, project: str) -> dict:
     p = Path(path)
     if not p.exists():
         return {}
-    with open(p, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(
+            f"Error: {p} is not valid JSON ({e.msg} at line {e.lineno}, column {e.colno}). "
+        ) from e
     if not isinstance(data, dict):
         return {}
     project_section = data.get(project) or {}

@@ -12,7 +12,7 @@ Full list lives in README.md under "Environment variables".
 
 
 # Pipeline-wide
-RATE_LIMIT_DELAY = 0.1            # seconds between API calls
+RATE_LIMIT_DELAY = 0              # seconds between API calls
 DEFAULT_RETRY_COUNT = 2           # 2 retries
 CHARACTER_VOICES_FILE = "character_voices.json"
 DEFAULT_PROVIDER = "elevenlabs" # Default provider when --provider is not passed.

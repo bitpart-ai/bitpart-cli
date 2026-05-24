@@ -162,4 +162,5 @@ def handle(args: argparse.Namespace) -> None:
         limit=args.limit,
         debug=args.debug,
         regenerate_drift=args.regenerate_drift,
+        cli_argv=sys.argv,
     )
