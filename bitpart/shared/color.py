@@ -25,6 +25,9 @@ def _supports_color() -> bool:
 _USE_COLOR = _supports_color()
 
 
-def yellow(s: str) -> str:
-    """Wrap a string in ANSI yellow, or return as-is if color isn't supported."""
-    return f"\033[33m{s}\033[0m" if _USE_COLOR else s
+def warn(s: str) -> None:
+    """Print a warning line in yellow (plain text when color is disabled)."""
+    if _USE_COLOR:
+        print(f"\033[33m{s}\033[0m")
+    else:
+        print(s)

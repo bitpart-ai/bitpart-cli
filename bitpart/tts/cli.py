@@ -49,6 +49,17 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="Path to the utterances CSV file. Falls back to env $BITPART_TTS_CSV_UTTERANCE when omitted.",
     )
     p.add_argument(
+        "--root",
+        type=str,
+        default=None,
+        help=(
+            "Directory that audio paths in the CSV are written relative to (so the CSV works on any "
+            "machine). Falls back to env $BITPART_TTS_ROOT, then the nearest folder above the CSV "
+            "that contains a .uproject, then the CSV's own folder. The Unreal SDK resolves "
+            "relative paths against the Unreal project directory."
+        ),
+    )
+    p.add_argument(
         "--provider",
         type=str,
         default=None,
@@ -135,6 +146,7 @@ def handle(args: argparse.Namespace) -> None:
     character_voices_path = (
         args.character_voices or os.environ.get("BITPART_TTS_CHARACTER_VOICES") or None
     )
+    root = args.root or os.environ.get("BITPART_TTS_ROOT") or None
     provider = args.provider or os.environ.get("BITPART_TTS_PROVIDER") or None
     if provider is not None and provider not in SUPPORTED_PROVIDERS:
         print(
@@ -157,9 +169,11 @@ def handle(args: argparse.Namespace) -> None:
         str(csv_path),
         output_dir=output_dir,
         character_voices_path=character_voices_path,
+        root=root,
         project=args.project,
         provider=provider,
         limit=args.limit,
         debug=args.debug,
         regenerate_drift=args.regenerate_drift,
+        cli_argv=sys.argv,
     )
