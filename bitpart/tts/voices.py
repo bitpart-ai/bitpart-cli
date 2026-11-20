@@ -9,12 +9,20 @@ configuration. Shape::
           "character_id": "...",
           "gender": "...",
           "providers": {
-            "elevenlabs": { "voice_id": "...", "stability": 0.6, ... },
+            "elevenlabs": {
+              "voice_ids": ["<default voice>", "<extra voice>", { "voice_id": "...", "stability": 0.4 }],
+              "stability": 0.6
+            },
             "inworld":    { "voice_id": "...", "temperature": 1.1, ... }
           }
         }
       }
     }
+
+``voice_ids`` is optional (a lone ``voice_id`` is still the single-voice form). The
+first entry is the ``default`` voice; the rest are named ``v2``, ``v3``, ... Each entry
+is a voice id string, or an object that also overrides settings for that voice only.
+Every entry is generated once per utterance; the SDK picks one voice per NPC instance.
 """
 import json
 from pathlib import Path
@@ -61,17 +69,75 @@ def load_character_voices(path: str | Path, project: str) -> dict:
     return project_section
 
 
-def get_voice_config_for_row(
-    row: pd.Series,
-    character_voices: dict,
-    provider: str,
-) -> tuple[dict | None, str]:
-    """Resolve the per-provider voice config for a CSV row.
+VOICE_IDS_KEY = "voice_ids"
+# Internal: the effective block handed back by ``_provider_block`` carries the extra
+# voices (everything after the first ``voice_ids`` entry) under this key.
+VARIANTS_KEY = "variants"
+DEFAULT_VOICE_NAME = "default"
 
-    Returns ``(cfg, reason)`` where ``cfg`` is a dict like
-    ``{"voice_id": "...", "stability": 0.6, ...}`` or ``None`` when the row
-    should be skipped. The string is a human-readable skip reason
-    (or ``""`` on success).
+
+def _voice_items(block: dict) -> list[dict]:
+    """Normalize ``voice_ids`` (strings or dicts) into per-voice override dicts, dropping duplicates.
+
+    Returns ``[]`` when ``voice_ids`` is absent or has no usable entries (the block's own
+    ``voice_id`` is then the single voice).
+    """
+    raw = block.get(VOICE_IDS_KEY)
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            item = {"voice_id": item}
+        if not isinstance(item, dict):
+            continue
+        voice_id = str(item.get("voice_id", "")).strip()
+        if not voice_id or voice_id in seen:
+            continue
+        seen.add(voice_id)
+        items.append({**item, "voice_id": voice_id})
+    return items
+
+
+def validate_voice_ids(character_voices: dict, provider: str) -> list[str]:
+    """Human-readable warnings for ``voice_ids`` entries that are ignored (blank, malformed, or repeated)."""
+    warnings: list[str] = []
+    for name, entry in character_voices.items():
+        if not isinstance(entry, dict):
+            continue
+        block = (entry.get("providers") or {}).get(provider)
+        if not isinstance(block, dict) or not isinstance(block.get(VOICE_IDS_KEY), list):
+            continue
+        ignored = len(block[VOICE_IDS_KEY]) - len(_voice_items(block))
+        if ignored:
+            warnings.append(
+                f"character '{name}' has {ignored} blank, malformed or duplicate entr"
+                f"{'y' if ignored == 1 else 'ies'} in providers.{provider}.{VOICE_IDS_KEY}; ignoring"
+            )
+    return warnings
+
+
+def count_voices(character_voices: dict, provider: str) -> int:
+    """Total voices (each generated once per utterance) configured across characters for ``provider``."""
+    total = 0
+    for entry in character_voices.values():
+        if not isinstance(entry, dict):
+            continue
+        block = (entry.get("providers") or {}).get(provider)
+        if isinstance(block, dict):
+            total += max(1, len(_voice_items(block)))
+    return total
+
+
+def _provider_block(
+    row: pd.Series, character_voices: dict, provider: str
+) -> tuple[dict | None, str]:
+    """Return ``(effective_block, reason)`` for a CSV row, or ``(None, reason)``.
+
+    With ``voice_ids``, the first entry is the default voice and the rest become variants named
+    ``v2``, ``v3``, ...; each entry may override the block's other settings for that voice only.
+    Without it, the block's ``voice_id`` is the single voice.
     """
     if not pd.notna(row.get("character_name")):
         return None, "character_name is empty"
@@ -82,19 +148,71 @@ def get_voice_config_for_row(
     if not isinstance(entry, dict):
         return None, f"character_name '{character_name}' not in character_voices.json"
     providers = entry.get("providers") or {}
-    cfg = providers.get(provider)
-    if not isinstance(cfg, dict):
+    block = providers.get(provider)
+    if not isinstance(block, dict):
         return None, f"character '{character_name}' has no '{provider}' provider entry"
+
+    base = {k: v for k, v in block.items() if k != VOICE_IDS_KEY}
+    items = _voice_items(block)
+    if not items:
+        return {**base, VARIANTS_KEY: {}}, ""
+    effective = {**base, **items[0]}
+    # Variants hold complete configs (shared settings + that entry's overrides).
+    effective[VARIANTS_KEY] = {
+        f"v{i}": {**base, **item} for i, item in enumerate(items[1:], start=2)
+    }
+    return effective, ""
+
+
+def get_voice_variant_names(
+    row: pd.Series, character_voices: dict, provider: str
+) -> list[str]:
+    """Names of the extra (non-default) voices configured for a row's character."""
+    block, _ = _provider_block(row, character_voices, provider)
+    if block is None:
+        return []
+    return list(block[VARIANTS_KEY])
+
+
+def get_voice_config_for_row(
+    row: pd.Series,
+    character_voices: dict,
+    provider: str,
+    variant: str | None = None,
+) -> tuple[dict | None, str]:
+    """Resolve the per-provider voice config for a CSV row.
+
+    Returns ``(cfg, reason)`` where ``cfg`` is a dict like
+    ``{"voice_id": "...", "stability": 0.6, ...}`` or ``None`` when the row
+    should be skipped. The string is a human-readable skip reason
+    (or ``""`` on success).
+
+    ``variant=None`` is the default voice (the first ``voice_ids`` entry, or the block's
+    ``voice_id``). A variant name (``v2``, ...) returns that voice's config: the block's
+    shared settings overlaid with the entry's own. ``voice_ids`` never appears in the result.
+    """
+    block, reason = _provider_block(row, character_voices, provider)
+    if block is None:
+        return None, reason
+    character_name = str(row["character_name"]).strip().lstrip("\ufeff")
+    cfg = {k: v for k, v in block.items() if k != VARIANTS_KEY}
+    label = ""
+    if variant is not None:
+        cfg = block[VARIANTS_KEY].get(variant)
+        if not isinstance(cfg, dict):
+            return None, f"character '{character_name}' has no voice '{variant}' for provider '{provider}'"
+        cfg = dict(cfg)
+        label = f" voice '{variant}'"
     voice_id = str(cfg.get("voice_id", "")).strip()
     if not voice_id:
-        return None, f"character '{character_name}' has empty voice_id for provider '{provider}'"
+        return None, f"character '{character_name}'{label} has empty voice_id for provider '{provider}'"
     return cfg, ""
 
 
 # Canonical key order used inside each character entry. Anything outside this
 # tuple (future schema additions, hand-authored fields) is preserved at the end
 # in its original order.
-_CANONICAL_ENTRY_KEY_ORDER = ("character_id", "gender", "providers")
+_CANONICAL_ENTRY_KEY_ORDER = ("character_id", "gender", "voice_count", "providers")
 
 
 def _canonicalize_entry(entry: dict) -> dict:
@@ -120,7 +238,7 @@ def _new_voice_entry(provider: str, character_id: str = "") -> dict:
         "character_id": character_id,
         "gender": "",
         "providers": {
-            provider: {"voice_id": ""},
+            provider: {VOICE_IDS_KEY: []},
         },
     }
 
@@ -203,7 +321,7 @@ def init_character_voices(
             providers_dict = {}
             entry["providers"] = providers_dict
         if provider not in providers_dict:
-            providers_dict[provider] = {"voice_id": ""}
+            providers_dict[provider] = {VOICE_IDS_KEY: []}
             added_provider_block += 1
             changed = True
 
@@ -234,4 +352,4 @@ def init_character_voices(
     print(f"  Added provider block:  {_entries(added_provider_block)} (existing)")
     print(f"  Already complete:      {_entries(already_complete)} (left untouched)")
     if added or added_provider_block:
-        print("  Edit voice_id/gender in the JSON before generating audio.")
+        print("  Add voice ids to voice_ids (first is the default) and set gender in the JSON before generating audio.")

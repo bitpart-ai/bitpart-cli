@@ -41,15 +41,24 @@ from bitpart.tts.config import (
 from bitpart.tts.csv_io import (
     csv_row_num,
     ensure_output_dir,
+    find_project_root,
+    format_voice_files,
     get_audio_filename,
     get_full_audio_path,
+    get_variant_audio_filename,
+    parse_voice_files,
     is_already_processed_in_output_dir,
     load_and_validate_dataframe,
+    resolve_stored_path,
+    to_stored_path,
 )
 from bitpart.tts.progress import print_progress
 from bitpart.tts.providers.inworld import text_with_optional_emotion
 from bitpart.tts.voices import (
     get_voice_config_for_row,
+    count_voices,
+    get_voice_variant_names,
+    validate_voice_ids,
     load_character_voices,
     resolve_voices_path,
 )
@@ -64,6 +73,7 @@ class RunConfig:
     """Immutable run-level settings, derived once from CLI args + env."""
     csv_path: str
     output_dir: str
+    root: Path  # paths in the CSV are stored relative to this (default: Unreal project dir, else CSV dir)
     project: str
     provider: str
     api_key: str
@@ -110,6 +120,7 @@ class CsvRowContext:
     filename: str
     full_path: str
     already_via_csv: bool
+    variant: str | None = None  # None = the default voice (``file_name`` column)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +131,7 @@ def convert_utterances_to_speech(
     csv_path: str,
     output_dir: str | None = None,
     character_voices_path: str | None = None,
+    root: str | None = None,
     project: str | None = None,
     provider: str = DEFAULT_PROVIDER,
     api_key: str | None = None,
@@ -139,6 +151,8 @@ def convert_utterances_to_speech(
         csv_path: Path to the utterances CSV file.
         output_dir: Directory to save audio files (default: same folder as CSV).
         character_voices_path: Override path to ``character_voices.json``.
+        root: Directory that CSV audio paths are relative to (default: nearest folder above the CSV
+            containing a ``.uproject``, else the CSV's folder).
         project: Top-level key in ``character_voices.json`` (e.g. ``Village``). Required.
         provider: ``"elevenlabs"`` or ``"inworld"``.
         api_key: API key for the provider (default: env ``ELEVENLABS_API_KEY`` / ``INWORLD_API_KEY``).
@@ -153,6 +167,7 @@ def convert_utterances_to_speech(
         csv_path=csv_path,
         output_dir=output_dir,
         character_voices_path=character_voices_path,
+        root=root,
         project=project,
         provider=provider,
         api_key=api_key,
@@ -174,10 +189,18 @@ def convert_utterances_to_speech(
     stats = RunStats()
     state: dict = {"need_newline": False}
 
+    limit_reported = False
     for idx, row in df.iterrows():
-        if cfg.limit is not None and (stats.generated + stats.errors) >= cfg.limit:
-            print_progress(state, cfg.debug, "skip", f"  Reached limit of {cfg.limit} utterance(s), stopping.")
-            break
+        if _limit_reached(cfg, stats):
+            if not limit_reported:
+                print_progress(
+                    state, cfg.debug, "skip",
+                    f"  Reached limit of {cfg.limit} utterance(s); no more audio will be generated, "
+                    f"remaining rows only get file_name filled in for audio that already exists.",
+                )
+                limit_reported = True
+            _sync_file_names_only(idx, row, df, cfg)
+            continue
         _process_csv_row(idx, row, df, cfg, stats, state)
 
     if state.get("need_newline"):
@@ -197,6 +220,7 @@ def _build_run_config(
     csv_path: str,
     output_dir: str | None,
     character_voices_path: str | None,
+    root: str | None,
     project: str | None,
     provider: str,
     api_key: str | None,
@@ -228,9 +252,14 @@ def _build_run_config(
     character_voices = load_character_voices(voices_path, project=project)
     inworld_model_id = os.environ.get("INWORLD_MODEL_ID", INWORLD_DEFAULT_MODEL_ID)
 
+    resolved_root = (
+        Path(root).resolve() if root else (find_project_root(csv_parent) or csv_parent)
+    )
+
     return RunConfig(
         csv_path=str(csv_path_resolved),
         output_dir=output_dir or str(csv_parent),
+        root=resolved_root,
         project=project,
         provider=provider_norm,
         api_key=resolved_api_key or "",
@@ -288,16 +317,63 @@ def _process_csv_row(
     stats: RunStats,
     state: dict,
 ) -> None:
-    """Dispatch a single row to the right branch (empty / existing / generate)."""
-    ctx = _csv_row_context_from(idx, row, cfg)
+    """Process one CSV row: the default voice, then each configured voice variant."""
+    variant_names = get_voice_variant_names(row, cfg.character_voices, cfg.provider)
+    # ``file_name`` holds every voice's path (see csv_io.parse_voice_files). Remember what was there for the
+    # "already processed" check, then rebuild the cell from this run so removed voices drop out.
+    previous_default, previous_variant_files = parse_voice_files(df.at[idx, "file_name"])
+    df.at[idx, "file_name"] = format_voice_files(previous_default, {})
+
+    for variant in (None, *variant_names):
+        if _limit_reached(cfg, stats):
+            # No more generation, but keep this row's existing audio in the CSV.
+            ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
+            _ensure_file_name_if_exists(df, ctx, cfg)
+            continue
+        _process_csv_row_voice(
+            idx, row, df, cfg, stats, state, variant, previous_variant_files
+        )
+
+
+def _limit_reached(cfg: RunConfig, stats: RunStats) -> bool:
+    return cfg.limit is not None and (stats.generated + stats.errors) >= cfg.limit
+
+
+def _sync_file_names_only(idx: int, row: pd.Series, df: pd.DataFrame, cfg: RunConfig) -> None:
+    """Fill ``file_name`` for a row from audio already on disk, without generating anything."""
+    variant_names = get_voice_variant_names(row, cfg.character_voices, cfg.provider)
+    previous_default, previous_variant_files = parse_voice_files(df.at[idx, "file_name"])
+    df.at[idx, "file_name"] = format_voice_files(previous_default, {})
+    if not (str(row["utterance_text"]).strip() if pd.notna(row["utterance_text"]) else ""):
+        return
+    for variant in (None, *variant_names):
+        ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
+        _ensure_file_name_if_exists(df, ctx, cfg)
+
+
+def _process_csv_row_voice(
+    idx: int,
+    row: pd.Series,
+    df: pd.DataFrame,
+    cfg: RunConfig,
+    stats: RunStats,
+    state: dict,
+    variant: str | None,
+    previous_variant_files: dict[str, str],
+) -> None:
+    """Dispatch one (row, voice) pair to the right branch (empty / existing / generate)."""
+    ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
 
     if not ctx.utterance_text:
-        _ensure_file_name_if_exists(df, ctx)
-        print_progress(state, cfg.debug, "skip", f"  Row {csv_row_num(ctx.idx)}: Skipping - empty utterance_text")
+        _ensure_file_name_if_exists(df, ctx, cfg)
+        if variant is None:
+            print_progress(state, cfg.debug, "skip", f"  Row {csv_row_num(ctx.idx)}: Skipping - empty utterance_text")
         stats.skipped += 1
         return
 
-    voice_cfg, skip_reason = get_voice_config_for_row(row, cfg.character_voices, cfg.provider)
+    voice_cfg, skip_reason = get_voice_config_for_row(
+        row, cfg.character_voices, cfg.provider, variant=variant
+    )
 
     if Path(ctx.full_path).exists():
         if _handle_existing_audio_file(ctx, voice_cfg, df, cfg, stats, state):
@@ -305,7 +381,7 @@ def _process_csv_row(
         # else: file was deleted for regeneration, fall through to generation
 
     if voice_cfg is None:
-        _ensure_file_name_if_exists(df, ctx)
+        _ensure_file_name_if_exists(df, ctx, cfg)
         print_progress(
             state, cfg.debug, "skip",
             f"  Row {csv_row_num(ctx.idx)}: Skipping - {skip_reason}. Update {cfg.voices_path} with a voice_id for the character.",
@@ -317,7 +393,24 @@ def _process_csv_row(
     _generate_audio_with_retry(ctx, voice_cfg, tts_text, df, cfg, stats, state)
 
 
-def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowContext:
+def _record_file_name(df: pd.DataFrame, ctx: CsvRowContext, cfg: RunConfig) -> None:
+    """Point the CSV's ``file_name`` cell at ``ctx.full_path`` (default voice or a named voice)."""
+    stored = to_stored_path(ctx.full_path, cfg.root)
+    default, variants = parse_voice_files(df.at[ctx.idx, "file_name"])
+    if ctx.variant is None:
+        default = stored
+    else:
+        variants[ctx.variant] = stored
+    df.at[ctx.idx, "file_name"] = format_voice_files(default, variants)
+
+
+def _csv_row_context_from(
+    idx: int,
+    row: pd.Series,
+    cfg: RunConfig,
+    variant: str | None = None,
+    previous_variant_files: dict[str, str] | None = None,
+) -> CsvRowContext:
     """Pull per-row values (text, ids, paths) into a CsvRowContext."""
     utterance_text = str(row["utterance_text"]).strip() if pd.notna(row["utterance_text"]) else ""
     character_id = str(row["character_id"]).strip()
@@ -327,9 +420,13 @@ def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowCon
         if pd.notna(row.get("character_name"))
         else ""
     )
-    filename = get_audio_filename(character_id, utterance_id)
+    if variant is None:
+        filename = get_audio_filename(character_id, utterance_id)
+        existing_file = resolve_stored_path(parse_voice_files(row.get("file_name", ""))[0], cfg.root)
+    else:
+        filename = get_variant_audio_filename(character_id, utterance_id, variant)
+        existing_file = resolve_stored_path((previous_variant_files or {}).get(variant, ""), cfg.root)
     full_path = get_full_audio_path(filename, cfg.output_dir)
-    existing_file = str(row.get("file_name", "")).strip()
     already_via_csv = is_already_processed_in_output_dir(
         existing_file, cfg.output_dir, cfg.skip_existing
     )
@@ -340,6 +437,7 @@ def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowCon
         filename=filename,
         full_path=full_path,
         already_via_csv=already_via_csv,
+        variant=variant,
     )
 
 
@@ -393,7 +491,7 @@ def _handle_provider_mismatch(
     files get their own counter so the summary line doesn't double-count them.
     """
     stats.provider_mismatch_files.append((ctx.full_path, file_provider))
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    _record_file_name(df, ctx, cfg)
     print_progress(
         state, cfg.debug, "skip_quiet",
         f"  Row {csv_row_num(ctx.idx)}: Skipping - already processed ({ctx.filename}); "
@@ -428,7 +526,7 @@ def _handle_audio_drift(
             return False
         except OSError as e:
             stats.drift_files.append(_drift_entry(ctx, cfg, issues))
-            df.at[ctx.idx, "file_name"] = ctx.full_path
+            _record_file_name(df, ctx, cfg)
             print_progress(
                 state, cfg.debug, "skip",
                 f"  Row {csv_row_num(ctx.idx)}: Audio metadata drift - cannot delete ({e}); leaving in place",
@@ -436,7 +534,7 @@ def _handle_audio_drift(
             return True
 
     stats.drift_files.append(_drift_entry(ctx, cfg, issues))
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    _record_file_name(df, ctx, cfg)
     print_progress(
         state, cfg.debug, "skip",
         f"  Row {csv_row_num(ctx.idx)}: Skipping - audio metadata drift ({ctx.filename})",
@@ -462,7 +560,7 @@ def _handle_audio_no_drift(
     state: dict,
 ) -> None:
     """Existing file matches current config; just sync the CSV's file_name column."""
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    _record_file_name(df, ctx, cfg)
     stats.skipped += 1
     if ctx.already_via_csv:
         msg = f"  Row {csv_row_num(ctx.idx)}: Skipping - already processed ({ctx.filename})"
@@ -506,7 +604,7 @@ def _generate_audio_with_retry(
                 provider_cfg=dict(voice_cfg),
                 tts_text_sent=tts_text if tts_text != ctx.utterance_text else None,
             )
-            df.at[ctx.idx, "file_name"] = ctx.full_path
+            _record_file_name(df, ctx, cfg)
             stats.generated += 1
             print_progress(
                 state, cfg.debug, "created",
@@ -529,10 +627,10 @@ def _generate_audio_with_retry(
                 stats.errors += 1
 
 
-def _ensure_file_name_if_exists(df: pd.DataFrame, ctx: CsvRowContext) -> None:
+def _ensure_file_name_if_exists(df: pd.DataFrame, ctx: CsvRowContext, cfg: RunConfig) -> None:
     """Sync df.file_name with disk: only set it if the audio file actually exists."""
     if Path(ctx.full_path).exists():
-        df.at[ctx.idx, "file_name"] = ctx.full_path
+        _record_file_name(df, ctx, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +705,17 @@ def _print_info_banner(cfg: RunConfig) -> None:
     if cfg.limit is not None:
         print(f"Limit: {cfg.limit} utterance(s)")
     print(f"Output audio directory: {cfg.output_dir}")
+    print(f"CSV audio paths are relative to: {cfg.root}")
     if cfg.character_voices:
         print(
             f"Character voices config: {cfg.voices_path} "
             f"(project '{cfg.project}', provider '{cfg.provider}')"
         )
+        total_voices = count_voices(cfg.character_voices, cfg.provider)
+        if total_voices > len(cfg.character_voices):
+            print(f"Voices configured: {total_voices} across {len(cfg.character_voices)} character(s) (default + variants)")
+        for message in validate_voice_ids(cfg.character_voices, cfg.provider):
+            warn(f"Warning: {message}")
     else:
         print(
             f"Warning: no entries found in {cfg.voices_path} for project '{cfg.project}'. "

@@ -136,7 +136,7 @@ def test_init_scaffolds_unique_character_names_with_only_requested_provider(tmp_
     townsperson_providers = data["Village"]["Townsperson"]["providers"]
     assert set(townsperson_providers.keys()) == {"inworld"}
     assert townsperson_providers["inworld"]["voice_id"] == ""
-
+    assert townsperson_providers["inworld"] == {"voice_ids": []}
 
 def test_init_does_not_overwrite_existing_provider_block(tmp_path):
     """Existing provider config (voice_id, tunables) must be preserved verbatim."""
@@ -200,7 +200,7 @@ def test_init_adds_missing_provider_block_to_existing_entry(tmp_path):
     # Both providers present; existing one untouched, new one is the empty skeleton.
     assert set(providers_block.keys()) == {"elevenlabs", "inworld"}
     assert providers_block["elevenlabs"] == {"voice_id": "PRESET"}
-    assert providers_block["inworld"] == {"voice_id": ""}
+    assert providers_block["inworld"] == {"voice_ids": []}
     # And the providers are written back in alphabetical order regardless of insertion order.
     assert list(providers_block.keys()) == ["elevenlabs", "inworld"]
 
@@ -387,3 +387,96 @@ def test_is_already_processed_false_when_empty_path(tmp_path):
     assert is_already_processed_in_output_dir(
         "", str(tmp_path), skip_existing=True
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# voice_ids (multiple voices per character)
+# ---------------------------------------------------------------------------
+
+from bitpart.tts.csv_io import format_voice_files, parse_voice_files
+from bitpart.tts.voices import count_voices, get_voice_variant_names, validate_voice_ids
+
+
+def _ids_voices(ids, **block_extra):
+    block = {"voice_ids": ids, "stability": 0.5, **block_extra}
+    return {"Tourist": {"providers": {"elevenlabs": block}}}
+
+
+_ROW = _row(character_name="Tourist")
+
+
+def test_first_voice_id_is_default_rest_are_variants():
+    voices = _ids_voices(["a", "b", "c"])
+    assert get_voice_variant_names(_ROW, voices, "elevenlabs") == ["v2", "v3"]
+    cfg, reason = get_voice_config_for_row(_ROW, voices, "elevenlabs")
+    assert reason == "" and cfg == {"voice_id": "a", "stability": 0.5}
+    cfg, _ = get_voice_config_for_row(_ROW, voices, "elevenlabs", variant="v3")
+    assert cfg == {"voice_id": "c", "stability": 0.5}
+
+
+def test_object_entries_override_settings_for_that_voice_only():
+    voices = _ids_voices([{"voice_id": "a", "stability": 0.9}, "b", {"voice_id": "c", "stability": 0.2}])
+    assert get_voice_config_for_row(_ROW, voices, "elevenlabs")[0] == {"voice_id": "a", "stability": 0.9}
+    assert get_voice_config_for_row(_ROW, voices, "elevenlabs", variant="v2")[0] == {"voice_id": "b", "stability": 0.5}
+    assert get_voice_config_for_row(_ROW, voices, "elevenlabs", variant="v3")[0] == {"voice_id": "c", "stability": 0.2}
+
+
+def test_single_voice_id_form_still_works():
+    voices = {"Tourist": {"providers": {"elevenlabs": {"voice_id": "solo", "stability": 0.6}}}}
+    assert get_voice_variant_names(_ROW, voices, "elevenlabs") == []
+    assert get_voice_config_for_row(_ROW, voices, "elevenlabs")[0] == {"voice_id": "solo", "stability": 0.6}
+
+
+def test_duplicates_and_blanks_are_ignored_with_warning():
+    voices = _ids_voices(["a", "a", "", "b"])
+    assert get_voice_variant_names(_ROW, voices, "elevenlabs") == ["v2"]
+    assert count_voices(voices, "elevenlabs") == 2
+    warnings = validate_voice_ids(voices, "elevenlabs")
+    assert len(warnings) == 1 and "2" in warnings[0]
+
+
+def test_empty_voice_ids_falls_back_to_block_voice_id_then_skips():
+    voices = _ids_voices([], voice_id="")
+    cfg, reason = get_voice_config_for_row(_ROW, voices, "elevenlabs")
+    assert cfg is None and "empty voice_id" in reason
+
+
+def test_voice_ids_and_variants_keys_not_in_cfg():
+    cfg, _ = get_voice_config_for_row(_ROW, _ids_voices(["a", "b"]), "elevenlabs")
+    assert "voice_ids" not in cfg and "variants" not in cfg
+
+
+def test_unknown_variant_is_skipped():
+    cfg, reason = get_voice_config_for_row(_ROW, _ids_voices(["a", "b"]), "elevenlabs", variant="v9")
+    assert cfg is None and "v9" in reason
+
+
+def test_voice_files_cell_round_trip():
+    variants = {"v2": "C:\\a\\x.mp3", "v3": "dir/y.mp3"}
+    cell = format_voice_files("dir/base.mp3", variants)
+    assert cell == "dir/base.mp3|C:\\a\\x.mp3|dir/y.mp3"
+    assert parse_voice_files(cell) == ("dir/base.mp3", variants)
+
+
+def test_voice_files_single_path_is_just_the_default():
+    assert parse_voice_files("audio/a.mp3") == ("audio/a.mp3", {})
+    assert format_voice_files("audio/a.mp3", {}) == "audio/a.mp3"
+    assert parse_voice_files(float("nan")) == ("", {})
+    assert parse_voice_files("") == ("", {})
+
+
+def test_voice_files_missing_voice_keeps_later_voices_in_place():
+    cell = format_voice_files("base.mp3", {"v3": "c.mp3"})
+    assert cell == "base.mp3||c.mp3"
+    assert parse_voice_files(cell) == ("base.mp3", {"v3": "c.mp3"})
+
+
+def test_voice_files_trailing_gaps_trimmed_and_missing_default_kept():
+    assert format_voice_files("base.mp3", {"v2": ""}) == "base.mp3"
+    cell = format_voice_files("", {"v2": "b.mp3"})
+    assert cell == "|b.mp3"
+    assert parse_voice_files(cell) == ("", {"v2": "b.mp3"})
+
+
+def test_voice_files_path_with_equals_is_fine():
+    assert parse_voice_files("dir/a=b.mp3") == ("dir/a=b.mp3", {})

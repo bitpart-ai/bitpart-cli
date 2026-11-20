@@ -8,6 +8,7 @@ def _minimal_config(**overrides) -> RunConfig:
     base = dict(
         csv_path="/tmp/u.csv",
         output_dir="/tmp",
+        root=Path("/tmp"),
         project="Tutorial",
         provider="inworld",
         api_key="",
