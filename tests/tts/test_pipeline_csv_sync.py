@@ -179,17 +179,40 @@ def test_absolute_paths_in_old_csv_become_relative_and_skip_regeneration(tmp_pat
     assert str(result.loc[0, "file_name"]) == f"audio/{mp3_path.name}"
 
 
-def test_root_defaults_to_nearest_uproject_dir(tmp_path):
-    from bitpart.tts.csv_io import find_project_root, resolve_stored_path, to_stored_path
+def test_root_defaults_to_csv_folder_even_inside_a_uproject(tmp_path, monkeypatch):
+    """Paths are relative to the CSV's folder by default (the importer resolves against the source CSV)."""
+    from bitpart.tts.csv_io import resolve_stored_path, to_stored_path
 
     proj = tmp_path / "Game"
-    (proj / "Artifacts").mkdir(parents=True)
+    csv_dir = proj / "Artifacts"
+    csv_dir.mkdir(parents=True)
     (proj / "Game.uproject").write_text("{}")
-    assert find_project_root(proj / "Artifacts") == proj.resolve()
-    assert find_project_root(tmp_path) is None
-    stored = to_stored_path(str(proj / "Artifacts" / "a.mp3"), proj)
-    assert stored == "Artifacts/a.mp3"
-    assert resolve_stored_path(stored, proj) == str((proj / "Artifacts" / "a.mp3").resolve())
+    audio_dir = tmp_path / "elsewhere" / "audio"  # outside the project, as in a separate-audio workflow
+    audio_dir.mkdir(parents=True)
+    csv_path = csv_dir / "utterances.csv"
+    pd.DataFrame(
+        [{"index": 0, "utterance_id": UTT_ID, "character_id": CHAR_ID, "character_name": CHAR_NAME,
+          "utterance_text": "Hello", "file_name": ""}]
+    ).to_csv(csv_path, index=False)
+    voices_path = tmp_path / "character_voices.json"
+    voices_path.write_text(
+        json.dumps({"Tutorial": {CHAR_NAME: {"providers": {"inworld": {"voice_id": "base"}}}}}),
+        encoding="utf-8",
+    )
+
+    def fake_generate(provider, *, full_path, cfg, **_k):
+        Path(full_path).write_bytes(b"\xff\xfb")
+
+    monkeypatch.setenv("INWORLD_API_KEY", "k")
+    with patch("bitpart.tts.providers.generate", side_effect=fake_generate):
+        convert_utterances_to_speech(
+            str(csv_path), output_dir=str(audio_dir), character_voices_path=str(voices_path),
+            project="Tutorial", provider="inworld", api_key="k",
+        )
+    stored = str(load_and_validate_dataframe(str(csv_path)).loc[0, "file_name"])
+    assert stored == f"../../elsewhere/audio/{get_audio_filename(CHAR_ID, UTT_ID)}"
+    assert resolve_stored_path(stored, csv_dir) == str((audio_dir / get_audio_filename(CHAR_ID, UTT_ID)).resolve())
+    assert to_stored_path(str(audio_dir / "a.mp3"), csv_dir) == "../../elsewhere/audio/a.mp3"
 
 
 def test_rerun_with_multi_voice_cell_does_not_regenerate(tmp_path, monkeypatch):

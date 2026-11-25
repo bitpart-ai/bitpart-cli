@@ -71,7 +71,7 @@ The utterances CSV (from Coppola) drives everything — it's the list of lines t
    python -m bitpart tts "path\to\utterances.csv" --project Village --provider elevenlabs
    ```
 
-   In short: the script reads the CSV, for each row looks up `character_voices.json[<project>][<character_name>].providers[<provider>]`, calls the API, saves MP3s in the **same folder as the CSV** as `{character_id}_{utterance_id}.mp3`, and updates the `file_name` column in the CSV with the file's path (relative to the project root, see below).
+   In short: the script reads the CSV, for each row looks up `character_voices.json[<project>][<character_name>].providers[<provider>]`, calls the API, saves MP3s in the output directory (default: same directory as csv) as `{character_id}_{utterance_id}.mp3`, and updates the `file_name` column in the CSV with the file's path.
 
 <details>
 <summary>What happens under the hood (flow diagram)</summary>
@@ -109,7 +109,6 @@ In-game, the CSV is looked up by `utterance_id` + `character_name` to find `file
 | `--provider` | `elevenlabs` (default) or `inworld`. Selects which `providers.<...>` block to use. |
 | `--init` | Scaffold/extend `character_voices.json` from the CSV and exit. No TTS calls. |
 | `--regenerate-drift` | Delete and regenerate any existing audio whose embedded `TTS_METADATA` no longer matches the CSV `utterance_text` or any audio-affecting key in the JSON entry (see [Drift detection](#drift-detection) for the per-provider list). Without this flag, drift is reported as a warning and the files are left alone. |
-| `--root` | Directory that audio paths in the CSV are written relative to (forward slashes), so the CSV works on every machine. Falls back to `$BITPART_TTS_ROOT`, then the nearest folder above the CSV containing a `.uproject`, then the CSV's folder. The Unreal importer resolves relative paths against the Unreal project directory, so the default is right when the CSV lives inside the Unreal project. Old CSVs with absolute paths are migrated to relative on the next run (no regeneration). |
 | `--character-voices` | Override the path to `character_voices.json` (default: alongside the CSV, then the script directory). |
 | `--output-dir` | Where audio files go (default: same folder as the CSV). |
 | `--limit N` | Generate at most N utterances (handy for testing, e.g. `--limit 1`). Rows after the limit are not generated, but `file_name` is still filled in for audio that already exists. |

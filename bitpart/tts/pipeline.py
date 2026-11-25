@@ -41,7 +41,6 @@ from bitpart.tts.config import (
 from bitpart.tts.csv_io import (
     csv_row_num,
     ensure_output_dir,
-    find_project_root,
     format_voice_files,
     get_audio_filename,
     get_full_audio_path,
@@ -73,7 +72,7 @@ class RunConfig:
     """Immutable run-level settings, derived once from CLI args + env."""
     csv_path: str
     output_dir: str
-    root: Path  # paths in the CSV are stored relative to this (default: Unreal project dir, else CSV dir)
+    root: Path  # paths in the CSV are stored relative to this (default: the CSV's own folder)
     project: str
     provider: str
     api_key: str
@@ -131,7 +130,6 @@ def convert_utterances_to_speech(
     csv_path: str,
     output_dir: str | None = None,
     character_voices_path: str | None = None,
-    root: str | None = None,
     project: str | None = None,
     provider: str = DEFAULT_PROVIDER,
     api_key: str | None = None,
@@ -151,8 +149,7 @@ def convert_utterances_to_speech(
         csv_path: Path to the utterances CSV file.
         output_dir: Directory to save audio files (default: same folder as CSV).
         character_voices_path: Override path to ``character_voices.json``.
-        root: Directory that CSV audio paths are relative to (default: nearest folder above the CSV
-            containing a ``.uproject``, else the CSV's folder).
+        (``file_name`` paths written to the CSV are always relative to the CSV's own folder.)
         project: Top-level key in ``character_voices.json`` (e.g. ``Village``). Required.
         provider: ``"elevenlabs"`` or ``"inworld"``.
         api_key: API key for the provider (default: env ``ELEVENLABS_API_KEY`` / ``INWORLD_API_KEY``).
@@ -167,7 +164,6 @@ def convert_utterances_to_speech(
         csv_path=csv_path,
         output_dir=output_dir,
         character_voices_path=character_voices_path,
-        root=root,
         project=project,
         provider=provider,
         api_key=api_key,
@@ -220,7 +216,6 @@ def _build_run_config(
     csv_path: str,
     output_dir: str | None,
     character_voices_path: str | None,
-    root: str | None,
     project: str | None,
     provider: str,
     api_key: str | None,
@@ -252,9 +247,9 @@ def _build_run_config(
     character_voices = load_character_voices(voices_path, project=project)
     inworld_model_id = os.environ.get("INWORLD_MODEL_ID", INWORLD_DEFAULT_MODEL_ID)
 
-    resolved_root = (
-        Path(root).resolve() if root else (find_project_root(csv_parent) or csv_parent)
-    )
+    # Audio paths in the CSV are always relative to the CSV's own folder. The Unreal importer resolves them
+    # against the folder of the CSV the DataTable was imported from.
+    resolved_root = csv_parent
 
     return RunConfig(
         csv_path=str(csv_path_resolved),

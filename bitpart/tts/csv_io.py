@@ -10,15 +10,6 @@ from pathlib import Path
 import pandas as pd
 
 
-def find_project_root(start: Path) -> Path | None:
-    """Nearest ancestor of ``start`` (inclusive) containing a ``*.uproject``, or None."""
-    start = Path(start).resolve()
-    for directory in (start, *start.parents):
-        if any(directory.glob("*.uproject")):
-            return directory
-    return None
-
-
 def to_stored_path(full_path: str, root: str | Path) -> str:
     """Path as written to the CSV: relative to ``root`` with forward slashes, so it works on any machine.
 
