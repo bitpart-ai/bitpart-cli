@@ -3,7 +3,8 @@
 Two modes, controlled by the ``debug`` flag in the pipeline:
 
 * ``skip`` / ``error``   - always full message (these are the user-visible signal)
-* ``created`` / ``file_exists`` - just a dot per row, with an every-50 milestone line
+* ``skip_quiet``         - full message only in debug mode; silent otherwise (existing-file skips)
+* ``created``            - dot per row in non-debug, with an every-50 milestone line
 
 State (``need_newline``) is threaded as a dict so callers can drop a newline
 before printing a non-dot message and not break the dot progress display.
@@ -25,7 +26,14 @@ def print_progress(
             state["need_newline"] = False
         print(message)
         return
-    if kind in ("created", "file_exists"):
+    if kind == "skip_quiet":
+        if debug:
+            if state.get("need_newline"):
+                print()
+                state["need_newline"] = False
+            print(message)
+        return
+    if kind == "created":
         if debug:
             if state.get("need_newline"):
                 print()

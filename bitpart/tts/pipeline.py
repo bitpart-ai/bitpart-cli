@@ -10,14 +10,16 @@ in isolation and be debugged on its own:
 
 * Setup phase     - ``_build_run_config``, ``_ensure_api_key_or_exit``
 * Per-row phase   - ``_process_csv_row`` and the ``_handle_*`` helpers it dispatches to
-* Post-loop phase - ``_write_csv_and_summary``, ``_print_*_warning``
+* Post-loop phase - ``_write_csv``, ``_print_run_summary``, ``_print_*_warning``
 
 Three small dataclasses (``RunConfig``, ``RunStats``, ``CsvRowContext``) bundle
 state so we don't have to thread 10+ args through every helper.
 """
 import os
+import shlex
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,7 +31,7 @@ from bitpart.tts.audio_metadata import (
     embed_mp3_metadata,
     get_file_provider,
 )
-from bitpart.shared.color import yellow
+from bitpart.shared.color import warn
 from bitpart.tts.config import (
     DEFAULT_PROVIDER,
     DEFAULT_RETRY_COUNT,
@@ -37,16 +39,25 @@ from bitpart.tts.config import (
     RATE_LIMIT_DELAY,
 )
 from bitpart.tts.csv_io import (
+    csv_row_num,
     ensure_output_dir,
+    format_voice_files,
     get_audio_filename,
     get_full_audio_path,
+    get_variant_audio_filename,
+    parse_voice_files,
     is_already_processed_in_output_dir,
     load_and_validate_dataframe,
+    resolve_stored_path,
+    to_stored_path,
 )
 from bitpart.tts.progress import print_progress
 from bitpart.tts.providers.inworld import text_with_optional_emotion
 from bitpart.tts.voices import (
     get_voice_config_for_row,
+    count_voices,
+    get_voice_variant_names,
+    validate_voice_ids,
     load_character_voices,
     resolve_voices_path,
 )
@@ -61,6 +72,7 @@ class RunConfig:
     """Immutable run-level settings, derived once from CLI args + env."""
     csv_path: str
     output_dir: str
+    root: Path  # paths in the CSV are stored relative to this (default: the CSV's own folder)
     project: str
     provider: str
     api_key: str
@@ -74,6 +86,17 @@ class RunConfig:
     debug: bool
     regenerate_drift: bool
     limit: int | None
+    cli_argv: tuple[str, ...] | None = None  # sys.argv when launched from CLI
+
+
+@dataclass
+class DriftFileEntry:
+    """One audio file whose embedded metadata no longer matches CSV / JSON."""
+    path: str
+    character_name: str
+    row_idx: int | None
+    provider: str
+    issues: list[str]
 
 
 @dataclass
@@ -83,7 +106,7 @@ class RunStats:
     skipped: int = 0
     errors: int = 0
     regenerated: int = 0
-    drift_files: list[tuple[str, list[str]]] = field(default_factory=list)
+    drift_files: list[DriftFileEntry] = field(default_factory=list)
     provider_mismatch_files: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -96,6 +119,7 @@ class CsvRowContext:
     filename: str
     full_path: str
     already_via_csv: bool
+    variant: str | None = None  # None = the default voice (``file_name`` column)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +137,7 @@ def convert_utterances_to_speech(
     limit: int | None = None,
     debug: bool = False,
     regenerate_drift: bool = False,
+    cli_argv: Sequence[str] | None = None,
 ) -> None:
     """Read CSV, generate audio for each row, embed metadata, write CSV back.
 
@@ -124,6 +149,7 @@ def convert_utterances_to_speech(
         csv_path: Path to the utterances CSV file.
         output_dir: Directory to save audio files (default: same folder as CSV).
         character_voices_path: Override path to ``character_voices.json``.
+        (``file_name`` paths written to the CSV are always relative to the CSV's own folder.)
         project: Top-level key in ``character_voices.json`` (e.g. ``Village``). Required.
         provider: ``"elevenlabs"`` or ``"inworld"``.
         api_key: API key for the provider (default: env ``ELEVENLABS_API_KEY`` / ``INWORLD_API_KEY``).
@@ -132,6 +158,7 @@ def convert_utterances_to_speech(
         debug: If True, print full message per file; otherwise dot progress.
         regenerate_drift: If True, delete + regenerate audio whose embedded metadata
             no longer matches the CSV / JSON.
+        cli_argv: Original ``sys.argv`` when invoked from the CLI (for copy-paste rerun hints).
     """
     cfg = _build_run_config(
         csv_path=csv_path,
@@ -144,6 +171,7 @@ def convert_utterances_to_speech(
         limit=limit,
         debug=debug,
         regenerate_drift=regenerate_drift,
+        cli_argv=tuple(cli_argv) if cli_argv is not None else None,
     )
 
     _print_info_banner(cfg)
@@ -157,18 +185,26 @@ def convert_utterances_to_speech(
     stats = RunStats()
     state: dict = {"need_newline": False}
 
+    limit_reported = False
     for idx, row in df.iterrows():
-        if cfg.limit is not None and (stats.generated + stats.errors) >= cfg.limit:
-            print_progress(state, cfg.debug, "skip", f"  Reached limit of {cfg.limit} utterance(s), stopping.")
-            break
+        if _limit_reached(cfg, stats):
+            if not limit_reported:
+                print_progress(
+                    state, cfg.debug, "skip",
+                    f"  Reached limit of {cfg.limit} utterance(s); no more audio will be generated, "
+                    f"remaining rows only get file_name filled in for audio that already exists.",
+                )
+                limit_reported = True
+            _sync_file_names_only(idx, row, df, cfg)
+            continue
         _process_csv_row(idx, row, df, cfg, stats, state)
-        time.sleep(RATE_LIMIT_DELAY)
 
     if state.get("need_newline"):
         print()
-    _write_csv_and_summary(df, cfg, stats)
+    _write_csv(df, cfg)
     _print_drift_warning(stats.drift_files, cfg)
     _print_provider_mismatch_warning(stats.provider_mismatch_files, cfg)
+    _print_run_summary(df, cfg, stats)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +223,7 @@ def _build_run_config(
     limit: int | None,
     debug: bool,
     regenerate_drift: bool,
+    cli_argv: tuple[str, ...] | None,
 ) -> RunConfig:
     """Validate CLI args, resolve paths/api_key/retry, and bundle into a RunConfig.
 
@@ -210,9 +247,14 @@ def _build_run_config(
     character_voices = load_character_voices(voices_path, project=project)
     inworld_model_id = os.environ.get("INWORLD_MODEL_ID", INWORLD_DEFAULT_MODEL_ID)
 
+    # Audio paths in the CSV are always relative to the CSV's own folder. The Unreal importer resolves them
+    # against the folder of the CSV the DataTable was imported from.
+    resolved_root = csv_parent
+
     return RunConfig(
         csv_path=str(csv_path_resolved),
         output_dir=output_dir or str(csv_parent),
+        root=resolved_root,
         project=project,
         provider=provider_norm,
         api_key=resolved_api_key or "",
@@ -226,6 +268,7 @@ def _build_run_config(
         debug=debug,
         regenerate_drift=regenerate_drift,
         limit=limit,
+        cli_argv=cli_argv,
     )
 
 
@@ -269,16 +312,63 @@ def _process_csv_row(
     stats: RunStats,
     state: dict,
 ) -> None:
-    """Dispatch a single row to the right branch (empty / existing / generate)."""
-    ctx = _csv_row_context_from(idx, row, cfg)
+    """Process one CSV row: the default voice, then each configured voice variant."""
+    variant_names = get_voice_variant_names(row, cfg.character_voices, cfg.provider)
+    # ``file_name`` holds every voice's path (see csv_io.parse_voice_files). Remember what was there for the
+    # "already processed" check, then rebuild the cell from this run so removed voices drop out.
+    previous_default, previous_variant_files = parse_voice_files(df.at[idx, "file_name"])
+    df.at[idx, "file_name"] = format_voice_files(previous_default, {})
+
+    for variant in (None, *variant_names):
+        if _limit_reached(cfg, stats):
+            # No more generation, but keep this row's existing audio in the CSV.
+            ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
+            _ensure_file_name_if_exists(df, ctx, cfg)
+            continue
+        _process_csv_row_voice(
+            idx, row, df, cfg, stats, state, variant, previous_variant_files
+        )
+
+
+def _limit_reached(cfg: RunConfig, stats: RunStats) -> bool:
+    return cfg.limit is not None and (stats.generated + stats.errors) >= cfg.limit
+
+
+def _sync_file_names_only(idx: int, row: pd.Series, df: pd.DataFrame, cfg: RunConfig) -> None:
+    """Fill ``file_name`` for a row from audio already on disk, without generating anything."""
+    variant_names = get_voice_variant_names(row, cfg.character_voices, cfg.provider)
+    previous_default, previous_variant_files = parse_voice_files(df.at[idx, "file_name"])
+    df.at[idx, "file_name"] = format_voice_files(previous_default, {})
+    if not (str(row["utterance_text"]).strip() if pd.notna(row["utterance_text"]) else ""):
+        return
+    for variant in (None, *variant_names):
+        ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
+        _ensure_file_name_if_exists(df, ctx, cfg)
+
+
+def _process_csv_row_voice(
+    idx: int,
+    row: pd.Series,
+    df: pd.DataFrame,
+    cfg: RunConfig,
+    stats: RunStats,
+    state: dict,
+    variant: str | None,
+    previous_variant_files: dict[str, str],
+) -> None:
+    """Dispatch one (row, voice) pair to the right branch (empty / existing / generate)."""
+    ctx = _csv_row_context_from(idx, row, cfg, variant, previous_variant_files)
 
     if not ctx.utterance_text:
-        _ensure_file_name_if_exists(df, ctx)
-        print_progress(state, cfg.debug, "skip", f"  Row {ctx.idx}: Skipping - empty utterance_text")
+        _ensure_file_name_if_exists(df, ctx, cfg)
+        if variant is None:
+            print_progress(state, cfg.debug, "skip", f"  Row {csv_row_num(ctx.idx)}: Skipping - empty utterance_text")
         stats.skipped += 1
         return
 
-    voice_cfg, skip_reason = get_voice_config_for_row(row, cfg.character_voices, cfg.provider)
+    voice_cfg, skip_reason = get_voice_config_for_row(
+        row, cfg.character_voices, cfg.provider, variant=variant
+    )
 
     if Path(ctx.full_path).exists():
         if _handle_existing_audio_file(ctx, voice_cfg, df, cfg, stats, state):
@@ -286,10 +376,10 @@ def _process_csv_row(
         # else: file was deleted for regeneration, fall through to generation
 
     if voice_cfg is None:
-        _ensure_file_name_if_exists(df, ctx)
+        _ensure_file_name_if_exists(df, ctx, cfg)
         print_progress(
             state, cfg.debug, "skip",
-            f"  Row {ctx.idx}: Skipping - {skip_reason}. Update {cfg.voices_path} with a voice_id for the character.",
+            f"  Row {csv_row_num(ctx.idx)}: Skipping - {skip_reason}. Update {cfg.voices_path} with a voice_id for the character.",
         )
         stats.skipped += 1
         return
@@ -298,7 +388,24 @@ def _process_csv_row(
     _generate_audio_with_retry(ctx, voice_cfg, tts_text, df, cfg, stats, state)
 
 
-def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowContext:
+def _record_file_name(df: pd.DataFrame, ctx: CsvRowContext, cfg: RunConfig) -> None:
+    """Point the CSV's ``file_name`` cell at ``ctx.full_path`` (default voice or a named voice)."""
+    stored = to_stored_path(ctx.full_path, cfg.root)
+    default, variants = parse_voice_files(df.at[ctx.idx, "file_name"])
+    if ctx.variant is None:
+        default = stored
+    else:
+        variants[ctx.variant] = stored
+    df.at[ctx.idx, "file_name"] = format_voice_files(default, variants)
+
+
+def _csv_row_context_from(
+    idx: int,
+    row: pd.Series,
+    cfg: RunConfig,
+    variant: str | None = None,
+    previous_variant_files: dict[str, str] | None = None,
+) -> CsvRowContext:
     """Pull per-row values (text, ids, paths) into a CsvRowContext."""
     utterance_text = str(row["utterance_text"]).strip() if pd.notna(row["utterance_text"]) else ""
     character_id = str(row["character_id"]).strip()
@@ -308,9 +415,13 @@ def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowCon
         if pd.notna(row.get("character_name"))
         else ""
     )
-    filename = get_audio_filename(character_id, utterance_id)
+    if variant is None:
+        filename = get_audio_filename(character_id, utterance_id)
+        existing_file = resolve_stored_path(parse_voice_files(row.get("file_name", ""))[0], cfg.root)
+    else:
+        filename = get_variant_audio_filename(character_id, utterance_id, variant)
+        existing_file = resolve_stored_path((previous_variant_files or {}).get(variant, ""), cfg.root)
     full_path = get_full_audio_path(filename, cfg.output_dir)
-    existing_file = str(row.get("file_name", "")).strip()
     already_via_csv = is_already_processed_in_output_dir(
         existing_file, cfg.output_dir, cfg.skip_existing
     )
@@ -321,6 +432,7 @@ def _csv_row_context_from(idx: int, row: pd.Series, cfg: RunConfig) -> CsvRowCon
         filename=filename,
         full_path=full_path,
         already_via_csv=already_via_csv,
+        variant=variant,
     )
 
 
@@ -348,8 +460,6 @@ def _handle_existing_audio_file(
         ctx.utterance_text,
         voice_cfg or {},
         current_provider=cfg.provider,
-        character_name=ctx.character_name,
-        row_idx=ctx.idx,
     )
     if issues:
         return _handle_audio_drift(ctx, issues, voice_cfg, df, cfg, stats, state)
@@ -376,10 +486,10 @@ def _handle_provider_mismatch(
     files get their own counter so the summary line doesn't double-count them.
     """
     stats.provider_mismatch_files.append((ctx.full_path, file_provider))
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    _record_file_name(df, ctx, cfg)
     print_progress(
-        state, cfg.debug, "file_exists",
-        f"  Row {ctx.idx}: Skipping - already processed ({ctx.filename}); "
+        state, cfg.debug, "skip_quiet",
+        f"  Row {csv_row_num(ctx.idx)}: Skipping - already processed ({ctx.filename}); "
         f"generated by '{file_provider}', not the current provider '{cfg.provider}'",
     )
 
@@ -404,27 +514,37 @@ def _handle_audio_drift(
             issues_block = "\n        " + "\n        ".join(issues)
             print_progress(
                 state, cfg.debug, "skip",
-                f"  Row {ctx.idx}: Audio metadata drift - deleted {ctx.filename} for regeneration"
+                f"  Row {csv_row_num(ctx.idx)}: Audio metadata drift - deleted {ctx.filename} for regeneration"
                 f"{issues_block}",
             )
             stats.regenerated += 1
             return False
         except OSError as e:
-            stats.drift_files.append((ctx.full_path, issues))
-            df.at[ctx.idx, "file_name"] = ctx.full_path
+            stats.drift_files.append(_drift_entry(ctx, cfg, issues))
+            _record_file_name(df, ctx, cfg)
             print_progress(
                 state, cfg.debug, "skip",
-                f"  Row {ctx.idx}: Audio metadata drift - cannot delete ({e}); leaving in place",
+                f"  Row {csv_row_num(ctx.idx)}: Audio metadata drift - cannot delete ({e}); leaving in place",
             )
             return True
 
-    stats.drift_files.append((ctx.full_path, issues))
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    stats.drift_files.append(_drift_entry(ctx, cfg, issues))
+    _record_file_name(df, ctx, cfg)
     print_progress(
         state, cfg.debug, "skip",
-        f"  Row {ctx.idx}: Skipping - audio metadata drift ({ctx.filename})",
+        f"  Row {csv_row_num(ctx.idx)}: Skipping - audio metadata drift ({ctx.filename})",
     )
     return True
+
+
+def _drift_entry(ctx: CsvRowContext, cfg: RunConfig, issues: list[str]) -> DriftFileEntry:
+    return DriftFileEntry(
+        path=ctx.full_path,
+        character_name=ctx.character_name,
+        row_idx=csv_row_num(ctx.idx),
+        provider=cfg.provider,
+        issues=issues,
+    )
 
 
 def _handle_audio_no_drift(
@@ -435,13 +555,13 @@ def _handle_audio_no_drift(
     state: dict,
 ) -> None:
     """Existing file matches current config; just sync the CSV's file_name column."""
-    df.at[ctx.idx, "file_name"] = ctx.full_path
+    _record_file_name(df, ctx, cfg)
     stats.skipped += 1
     if ctx.already_via_csv:
-        msg = f"  Row {ctx.idx}: Skipping - already processed ({ctx.filename})"
+        msg = f"  Row {csv_row_num(ctx.idx)}: Skipping - already processed ({ctx.filename})"
     else:
-        msg = f"  Row {ctx.idx}: Skipping - file exists, updating CSV only ({ctx.filename})"
-    print_progress(state, cfg.debug, "file_exists", msg)
+        msg = f"  Row {csv_row_num(ctx.idx)}: Skipping - file exists, updating CSV only ({ctx.filename})"
+    print_progress(state, cfg.debug, "skip_quiet", msg)
 
 
 def _compute_tts_text(utterance_text: str, row: pd.Series, cfg: RunConfig) -> str:
@@ -479,115 +599,172 @@ def _generate_audio_with_retry(
                 provider_cfg=dict(voice_cfg),
                 tts_text_sent=tts_text if tts_text != ctx.utterance_text else None,
             )
-            df.at[ctx.idx, "file_name"] = ctx.full_path
+            _record_file_name(df, ctx, cfg)
             stats.generated += 1
             print_progress(
                 state, cfg.debug, "created",
-                f"  Row {ctx.idx}: Created - {ctx.filename}",
+                f"  Row {csv_row_num(ctx.idx)}: Created - {ctx.filename}",
                 filename_for_milestone=ctx.filename,
                 success_count=stats.generated,
             )
+            time.sleep(RATE_LIMIT_DELAY)
             return
         except Exception as e:
             if attempt < cfg.max_attempts - 1:
-                print_progress(state, cfg.debug, "skip", f"  Row {ctx.idx}: Retrying after error - {e}")
+                print_progress(state, cfg.debug, "skip", f"  Row {csv_row_num(ctx.idx)}: Retrying after error - {e}")
                 time.sleep(RATE_LIMIT_DELAY)
             else:
                 msg = (
                     f"ERROR (after {cfg.retry_count} retry(s)) - {e}"
                     if cfg.retry_count else f"ERROR - {e}"
                 )
-                print_progress(state, cfg.debug, "error", f"  Row {ctx.idx}: {msg}")
+                print_progress(state, cfg.debug, "error", f"  Row {csv_row_num(ctx.idx)}: {msg}")
                 stats.errors += 1
 
 
-def _ensure_file_name_if_exists(df: pd.DataFrame, ctx: CsvRowContext) -> None:
+def _ensure_file_name_if_exists(df: pd.DataFrame, ctx: CsvRowContext, cfg: RunConfig) -> None:
     """Sync df.file_name with disk: only set it if the audio file actually exists."""
     if Path(ctx.full_path).exists():
-        df.at[ctx.idx, "file_name"] = ctx.full_path
+        _record_file_name(df, ctx, cfg)
 
 
 # ---------------------------------------------------------------------------
 # Post-loop phase - print summary and warnings
 # ---------------------------------------------------------------------------
 
-def _write_csv_and_summary(df: pd.DataFrame, cfg: RunConfig, stats: RunStats) -> None:
-    """Persist the updated CSV and print the one-line numeric summary."""
+_BANNER_WIDTH = 60
+
+
+def _hash_banner(title: str | None = None) -> None:
+    """Print a `#` line: full-width rule when ``title`` is omitted/empty, else centered title."""
+    if not title:
+        print("#" * _BANNER_WIDTH)
+        return
+    label = f" {title} "
+    side = max(0, (_BANNER_WIDTH - len(label)) // 2)
+    print("\n" + "#" * side + label + "#" * (_BANNER_WIDTH - side - len(label)))
+
+
+def _display_cli_argv(argv: list[str]) -> list[str]:
+    """Copy-paste hint argv starting with ``bitpart`` (args from ``tts`` onward)."""
+    if not argv:
+        return argv
+    rest = argv[argv.index("tts"):] if "tts" in argv else argv[1:]
+    return ["bitpart", *rest]
+
+
+def _regenerate_drift_command(cfg: RunConfig) -> str | None:
+    """Copy-paste rerun hint from captured CLI argv, or None if unavailable."""
+    if not cfg.cli_argv:
+        return None
+    argv = _display_cli_argv(list(cfg.cli_argv))
+    if "--regenerate-drift" not in argv:
+        argv.append("--regenerate-drift")
+    return shlex.join(argv)
+
+
+def _write_csv(df: pd.DataFrame, cfg: RunConfig) -> Path:
+    """Write the updated dataframe back to the utterances CSV."""
     output_csv = Path(cfg.csv_path).resolve()
     df.to_csv(output_csv, index=False)
+    return output_csv
+
+
+def _print_run_summary(df: pd.DataFrame, cfg: RunConfig, stats: RunStats) -> None:
+    """Print the run summary in a closing banner block."""
+    output_csv = Path(cfg.csv_path).resolve()
     rows_with_files = (df["file_name"].astype(str).str.strip() != "").sum()
 
-    summary = (
-        f"\nDone. Generated: {stats.generated}, "
-        f"Skipped: {stats.skipped}, Errors: {stats.errors}"
-    )
+    _hash_banner("Summary")
+    parts = [
+        f"Generated: {stats.generated}",
+        f"Skipped: {stats.skipped}",
+        f"Errors: {stats.errors}",
+    ]
     if cfg.regenerate_drift and stats.regenerated:
-        summary += f", Regenerated (drift): {stats.regenerated}"
+        parts.append(f"Regenerated (drift): {stats.regenerated}")
     if stats.drift_files:
-        summary += f", Drift (not regenerated): {len(stats.drift_files)}"
+        parts.append(f"Drift (not regenerated): {len(stats.drift_files)}")
     if stats.provider_mismatch_files:
-        summary += f", Wrong-provider audio: {len(stats.provider_mismatch_files)}"
-    print(summary)
+        parts.append(f"Wrong-provider audio: {len(stats.provider_mismatch_files)}")
+    print(f"Done. {', '.join(parts)}.")
     print(f"CSV saved to: {output_csv}")
-    print(f"Rows with file_name set: {rows_with_files} of {len(df)}")
+    print(f"Rows looked at: {rows_with_files} of {len(df)}")
+    _hash_banner()
 
 
 def _print_info_banner(cfg: RunConfig) -> None:
     """The hash-banner block printed at the start of every run."""
-    banner_width = 60
-    header_label = " Info "
-    side = (banner_width - len(header_label)) // 2
-    print("#" * side + header_label + "#" * (banner_width - side - len(header_label)))
+    _hash_banner("Info")
     print(f"Processing: {cfg.csv_path}")
     if cfg.limit is not None:
         print(f"Limit: {cfg.limit} utterance(s)")
     print(f"Output audio directory: {cfg.output_dir}")
+    print(f"CSV audio paths are relative to: {cfg.root}")
     if cfg.character_voices:
         print(
             f"Character voices config: {cfg.voices_path} "
             f"(project '{cfg.project}', provider '{cfg.provider}')"
         )
+        total_voices = count_voices(cfg.character_voices, cfg.provider)
+        if total_voices > len(cfg.character_voices):
+            print(f"Voices configured: {total_voices} across {len(cfg.character_voices)} character(s) (default + variants)")
+        for message in validate_voice_ids(cfg.character_voices, cfg.provider):
+            warn(f"Warning: {message}")
     else:
         print(
             f"Warning: no entries found in {cfg.voices_path} for project '{cfg.project}'. "
             f"Run with --init to scaffold one from this CSV."
         )
-    print("#" * banner_width)
+
+
+def _print_drift_file_entry(entry: DriftFileEntry) -> None:
+    """Print one drift file block (filename, context, issues, separator).
+    Example:
+    File: my_audio_file.mp3
+    character 'BarPatron1', CSV row 4, provider inworld
+    • voice_id: audio file has 'Lucian', character_voices.json has 'LucianQ'
+    • utterance_text: audio file has 'Yes.', CSV has 'Yezz.'
+    ----
+    """
+    warn(f"  File: {Path(entry.path).name}")
+    context_parts = [f"CSV row {entry.row_idx}", f"provider {entry.provider}"]
+    if entry.character_name:
+        context_parts.insert(0, f"character {entry.character_name!r}")
+    warn(f"    {', '.join(context_parts)}")
+    for issue in entry.issues:
+        warn(f"    • {issue}")
+    warn("  ------")
 
 
 def _print_drift_warning(
-    drift_files: list[tuple[str, list[str]]],
+    drift_files: list[DriftFileEntry],
     cfg: RunConfig,
 ) -> None:
-    """Emit the yellow WARNING block + --regenerate-drift suggestion."""
+    """Emit drift details and a copy-paste regenerate command."""
     if not drift_files:
         return
     n = len(drift_files)
     files_word = "file" if n == 1 else "files"
     verb_word = "has" if n == 1 else "have"
     print()
-    print(yellow(
-        f"WARNING: {n} audio {files_word} {verb_word} metadata that no longer matches "
-        f"the CSV ({Path(cfg.csv_path).name}) or '{cfg.voices_path.name}'. "
-        f"This means the audio file no longer matches what you currently have configured."
-    ))
+    warn(
+        f"{n} audio {files_word} {verb_word} metadata that no longer matches "
+        f"the CSV ({Path(cfg.csv_path).name}) or '{cfg.voices_path.name}'."
+    )
     max_show = 25
-    for fp, issues in drift_files[:max_show]:
-        print(yellow(f"  - {fp}"))
-        for iss in issues:
-            print(yellow(f"        {iss}"))
+    for entry in drift_files[:max_show]:
+        _print_drift_file_entry(entry)
     if len(drift_files) > max_show:
-        print(yellow(f"  ... and {len(drift_files) - max_show} more"))
+        warn(f"  ... and {len(drift_files) - max_show} more")
     print()
-    print("To delete these files and regenerate them in one step, re-run with --regenerate-drift:")
-    cmd_parts = [
-        "bitpart tts",
-        f"\"{cfg.csv_path}\"",
-        f"--project {cfg.project}",
-        f"--provider {cfg.provider}",
-        "--regenerate-drift",
-    ]
-    print("  " + " ".join(cmd_parts))
+    _hash_banner("Drift Detected")
+    warn("To regenerate these audio files, re-run with --regenerate-drift:")
+    cmd = _regenerate_drift_command(cfg)
+    if cmd is not None:
+        warn('""" Run Command:')
+        warn(f"{cmd}")
+        warn('"""')
 
 
 def _print_provider_mismatch_warning(
@@ -603,11 +780,10 @@ def _print_provider_mismatch_warning(
     n = len(provider_mismatch_files)
     files_word = "file" if n == 1 else "files"
     verb_word = "was" if n == 1 else "were"
-    per_prov = ", ".join(f"{c} from '{p}'" for p, c in sorted(by_prov.items()))
-    print()
-    print(yellow(
-        f"WARNING: {n} existing audio {files_word} {verb_word} generated by a different "
-        f"provider than the current run (--provider {cfg.provider}): {per_prov}. "
-        f"They were left as-is."
-    ))
-    print(yellow("  Suggestion: move these files aside and re-run your previous command."))
+    per_prov = ", ".join(f"{c} from audio generated by '{p}'" for p, c in sorted(by_prov.items()))
+    _hash_banner("Different Provider Detected")
+    warn(
+        f"{n} existing audio {files_word} {verb_word} generated by a different "
+        f"provider than this run (--provider {cfg.provider}): {per_prov}."
+    )
+    warn("Suggestion: move audio files aside and re-run your previous command.")

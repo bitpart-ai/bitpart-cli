@@ -58,9 +58,9 @@ The utterances CSV (from Coppola) drives everything — it's the list of lines t
    ```powershell
    bitpart tts "path\to\utterances.csv" --project Village --init --provider elevenlabs(or 'inworld')
    ```
-   This scans the CSV, collects unique `character_name` values, and writes a skeleton `character_voices.json` with empty `voice_id`/`gender` you can fill in.
+   This scans the CSV, collects unique `character_name` values, and writes a skeleton `character_voices.json` with an empty `voice_ids` list and empty `gender` you can fill in.
 
-2. **Edit `character_voices.json`** and fill in `voice_id` for each provider you'll use, plus `gender` if helpful.
+2. **Edit `character_voices.json`** and add voice ids to `voice_ids` for each provider (the first is the default voice; see below) you'll use, plus `gender` if helpful.
 
 3. **Generate audio**:
    ```powershell
@@ -71,7 +71,7 @@ The utterances CSV (from Coppola) drives everything — it's the list of lines t
    python -m bitpart tts "path\to\utterances.csv" --project Village --provider elevenlabs
    ```
 
-   In short: the script reads the CSV, for each row looks up `character_voices.json[<project>][<character_name>].providers[<provider>]`, calls the API, saves MP3s in the **same folder as the CSV** as `{character_id}_{utterance_id}.mp3`, and updates the `file_name` column in the CSV with the full path.
+   In short: the script reads the CSV, for each row looks up `character_voices.json[<project>][<character_name>].providers[<provider>]`, calls the API, saves MP3s in the output directory (default: same directory as csv) as `{character_id}_{utterance_id}.mp3`, and updates the `file_name` column in the CSV with the file's path.
 
 <details>
 <summary>What happens under the hood (flow diagram)</summary>
@@ -111,8 +111,8 @@ In-game, the CSV is looked up by `utterance_id` + `character_name` to find `file
 | `--regenerate-drift` | Delete and regenerate any existing audio whose embedded `TTS_METADATA` no longer matches the CSV `utterance_text` or any audio-affecting key in the JSON entry (see [Drift detection](#drift-detection) for the per-provider list). Without this flag, drift is reported as a warning and the files are left alone. |
 | `--character-voices` | Override the path to `character_voices.json` (default: alongside the CSV, then the script directory). |
 | `--output-dir` | Where audio files go (default: same folder as the CSV). |
-| `--limit N` | Only process N utterances (handy for testing, e.g. `--limit 1`). |
-| `--debug` | Print one line per file instead of a dot-per-file progress bar. Also surfaces the per-row "Skipping - already processed" / "file exists, updating CSV only" lines that are otherwise collapsed into dots. |
+| `--limit N` | Generate at most N utterances (handy for testing, e.g. `--limit 1`). Rows after the limit are not generated, but `file_name` is still filled in for audio that already exists. |
+| `--debug` | Print one line per file instead of a dot-per-file progress bar. Also surfaces per-row "Skipping - already processed" / "file exists, updating CSV only" lines for existing audio (silent in the default mode). |
 
 ## Configuration
 
@@ -167,6 +167,28 @@ One JSON file holds voice configs for every character, organized by project (loc
 - `character_id` - the game's UUID for this character. Stored for cross-reference; not required for lookup. Filled in automatically by `--init`.
 - `gender` - informational metadata. Useful when humans pick voices; not used by the script.
 - `providers.<provider>` - per-provider voice configuration. Always has `voice_id`. An empty `voice_id` causes the row to be skipped for that provider.
+
+### Multiple voices per character (optional)
+
+Many NPCs are instances of one archetype (a guard, say), so a character can have several voices. List them in `voice_ids` inside the provider block, in place of `voice_id`:
+
+```json
+"Watch": {
+  "providers": {
+    "elevenlabs": {
+      "voice_ids": ["IRHApOXLvnW57QJPQH2P", "yl2ZDV1MzN4HbQJbMihG", { "voice_id": "54Cze5LrTSyLgbO6Fhlc", "stability": 0.4 }],
+      "stability": 0.6
+    }
+  }
+}
+```
+
+- Every entry is generated **once per utterance**. Entries are voice id strings, or objects that also override settings (`stability` etc.) for that voice only. Settings next to `voice_ids` are shared by all of them.
+- The first entry is the `default` voice. It keeps the usual `{character_id}_{utterance_id}.mp3` name and `file_name` column, so a character that already has audio under one `voice_id` doesn't regenerate it (make that voice the first entry).
+- The rest are named `v2`, `v3`, ... in list order and written as `{character_id}_{utterance_id}__v2.mp3`. All paths for a line live in the one `file_name` cell: a single voice is just the path; several voices are the paths separated by `|` in `voice_ids` order (`default|v2|v3`). An empty slot (`a||c`) means that voice has no audio, so later voices keep their position. **Append new voices at the end**: reordering renames them and drift detection will flag the files.
+- Blank or repeated ids are ignored with a warning. A lone `voice_id` (no `voice_ids`) still means one voice.
+- Drift detection works per file. Removing an entry stops generating it but never deletes its files. Each voice costs one API call per utterance.
+- In Unreal, the Bitpart utterance import turns each name into a voice id the SDK assigns to NPCs.
 
 ### Per-character provider overrides (optional)
 
@@ -240,7 +262,7 @@ To delete these files and regenerate them in one step, re-run with --regenerate-
 
 Independently of drift, the script also checks the `provider` field embedded in each existing MP3. If a file was generated with a different provider than the one you're running now (`--provider`):
 
-- the row is silently skipped (you'll see it grouped under the dot-progress in non-debug mode, or `Skipping - already processed (...); generated by '<X>', not the current provider '<Y>'` in `--debug`),
+- the row is silently skipped in non-debug mode (use `--debug` for per-row `Skipping - already processed (...); generated by '<X>', not the current provider '<Y>'` lines),
 - **the same-provider drift check is bypassed for that row** (comparing voice_ids across providers is meaningless because the IDs live in different namespaces), and
 - an end-of-run yellow `WARNING` block summarizes them with a *suggestion* to move them aside so the next run regenerates them under the new provider:
 

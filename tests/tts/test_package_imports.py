@@ -77,12 +77,13 @@ def test_inworld_emotion_helper_in_provider_module():
     assert text_with_optional_emotion("hi", "") == "hi"
 
 
-def test_color_helper_returns_string():
-    from bitpart.shared.color import yellow
-    out = yellow("warn")
-    assert "warn" in out
-    assert isinstance(out, str)
+def test_warn_prints_message(monkeypatch, capsys):
+    monkeypatch.setattr("bitpart.shared.color._USE_COLOR", True)
+    from bitpart.shared.color import warn
 
+    warn("hello")
+    out = capsys.readouterr().out
+    assert "\033[33m" in out and "hello" in out and "\033[0m" in out
 
 def test_load_character_voices_via_package(tmp_path):
     import json

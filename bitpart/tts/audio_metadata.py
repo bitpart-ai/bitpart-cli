@@ -105,54 +105,38 @@ def get_file_provider(path: str) -> str:
     return str(meta.get("provider", "")) if meta else ""
 
 
-def _voice_id_drift_message(
-    embedded_voice_id: str,
-    expected_voice_id: str,
+def _format_drift_issue(
+    field_name: str,
+    embedded_value: object,
+    current_value: object,
     *,
-    file_provider: str,
-    current_provider: str,
-    key_part: str,
-    row_part: str,
-    cont: str,
+    current_source: str,
 ) -> str:
-    """voice_id is special-cased so the cross-provider message format is preserved.
-
-    (Comparing voice_ids across providers is meaningless because the IDs live
-    in different namespaces; the message makes that explicit.)
-    """
-    if file_provider and current_provider and file_provider != current_provider:
-        provider_part = (
-            f"provider(previous)={file_provider} provider(current)={current_provider}"
-        )
-    elif current_provider:
-        provider_part = f"provider={current_provider}"
-    elif file_provider:
-        provider_part = f"provider={file_provider}"
-    else:
-        provider_part = ""
-    head = " ".join(p for p in (key_part, row_part, provider_part) if p)
+    """One line: value embedded in the audio file vs value in CSV/JSON today."""
     return (
-        f"voice_id drift ({head}{cont}"
-        f"audio_file(previous)='{embedded_voice_id}', json(current)='{expected_voice_id}')"
+        f"{field_name}: audio file has {embedded_value!r}, "
+        f"{current_source} has {current_value!r}"
     )
 
 
-def _generic_key_drift_message(
-    key: str,
-    embedded_value: object,
-    expected_value: object,
+def _voice_id_drift_message(
+    embedded_voice_id: str,
+    current_voice_id: str,
     *,
+    embedded_provider: str,
     current_provider: str,
-    key_part: str,
-    row_part: str,
-    cont: str,
 ) -> str:
-    """Drift message for any audio-affecting key other than voice_id."""
-    provider_part = f"provider={current_provider}" if current_provider else ""
-    head = " ".join(p for p in (key_part, row_part, provider_part) if p)
-    return (
-        f"{key} drift ({head}{cont}"
-        f"audio_file(previous)={embedded_value!r}, json(current)={expected_value!r})"
+    """voice_id drift; call out both providers when they differ (IDs aren't comparable)."""
+    if embedded_provider and current_provider and embedded_provider != current_provider:
+        return (
+            f"voice_id: audio file has {embedded_voice_id!r} (provider {embedded_provider}), "
+            f"character_voices.json has {current_voice_id!r} (provider {current_provider})"
+        )
+    return _format_drift_issue(
+        "voice_id",
+        embedded_voice_id,
+        current_voice_id,
+        current_source="character_voices.json",
     )
 
 
@@ -161,8 +145,6 @@ def check_metadata_drift(
     expected_utterance_text: str,
     expected_config: dict,
     current_provider: str = "",
-    character_name: str = "",
-    row_idx: int | None = None,
 ) -> list[str]:
     """Compare the embedded metadata against current CSV / JSON expectations.
 
@@ -179,43 +161,46 @@ def check_metadata_drift(
     meta = read_tts_metadata(path)
     if meta is None:
         return []
-    # 8 spaces aligns continuation lines under the bullet in the summary report.
-    cont = "\n" + " " * 8
-    key_part = f"key={character_name}" if character_name else ""
-    row_part = f"csv_row={row_idx}" if row_idx is not None else ""
-    file_provider = str(meta.get("provider", ""))
-    embedded_audio_cfg = meta.get("config") or {}
+    embedded_provider = str(meta.get("provider", ""))
+    embedded_config = meta.get("config") or {}
 
     issues: list[str] = []
 
     # Provider-config drift — iterate over every audio-affecting key for this provider.
     keys_to_check = PROVIDER_DRIFT_KEYS.get(current_provider, ("voice_id",))
     for key in keys_to_check:
-        if key not in embedded_audio_cfg or key not in expected_config:
+        if key not in embedded_config or key not in expected_config:
             continue  # intersection rule: skip when either side doesn't define it
-        embedded_value = embedded_audio_cfg[key]
-        expected_value = expected_config[key]
-        if str(embedded_value) == str(expected_value):
+        embedded_value = embedded_config[key]
+        current_value = expected_config[key]
+        if str(embedded_value) == str(current_value):
             continue
         if key == "voice_id":
             issues.append(_voice_id_drift_message(
-                str(embedded_value), str(expected_value),
-                file_provider=file_provider, current_provider=current_provider,
-                key_part=key_part, row_part=row_part, cont=cont,
+                str(embedded_value),
+                str(current_value),
+                embedded_provider=embedded_provider,
+                current_provider=current_provider,
             ))
         else:
-            issues.append(_generic_key_drift_message(
-                key, embedded_value, expected_value,
-                current_provider=current_provider,
-                key_part=key_part, row_part=row_part, cont=cont,
+            issues.append(_format_drift_issue(
+                key,
+                embedded_value,
+                current_value,
+                current_source="character_voices.json",
             ))
 
     # utterance_text drift (CSV-side, not provider-config).
-    embedded_text = str(meta.get("utterance_text", ""))
-    if expected_utterance_text and embedded_text and embedded_text != expected_utterance_text:
-        head = " ".join(p for p in (key_part, row_part) if p)
-        issues.append(
-            f"utterance_text drift ({head}{cont}"
-            f"audio_file(previous)={embedded_text!r}, csv(current)={expected_utterance_text!r})"
-        )
+    embedded_utterance_text = str(meta.get("utterance_text", ""))
+    if (
+        expected_utterance_text
+        and embedded_utterance_text
+        and embedded_utterance_text != expected_utterance_text
+    ):
+        issues.append(_format_drift_issue(
+            "utterance_text",
+            embedded_utterance_text,
+            expected_utterance_text,
+            current_source="CSV",
+        ))
     return issues
